@@ -341,6 +341,14 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
+    _cmd("route-review", [
+        _TASK_ID,
+        _arg("--target", required=True, choices=("review", "scheduled")),
+        _arg("--expected-event-id", required=True, type=int, help="Latest task event observed before routing"),
+        _arg("--reviewer", help="Required for Review; must differ from the original implementer"),
+        _arg("--summary", help="Full checkpoint summary (inherits prior summary if omitted)"),
+        _arg("--metadata", help="JSON object merged into prior checkpoint metadata"),
+    ], help="Atomically reroute or park a pending review without implementation rework"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
