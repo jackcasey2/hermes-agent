@@ -118,6 +118,61 @@ def test_worker_scheduled_review_resumes_with_original_checkpoint(store):
     assert _task(store, task_id).assignee == "second-reviewer"
 
 
+def _stamp_worker(conn, task_id):
+    run_id = _task(conn, task_id).current_run_id
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET worker_pid = 123, worker_started_at = 'fixture-spawn' WHERE id = ?", (task_id,))
+        conn.execute("UPDATE task_runs SET worker_pid = 456, worker_started_at = 'fixture-bound' WHERE id = ?", (run_id,))
+        kb._append_event(conn, task_id, "spawned", {"pid": 123, "started_at": "fixture-spawn"}, run_id=run_id)
+        kb._append_event(conn, task_id, "worker_bound", {"pid": 456, "started_at": "fixture-bound"}, run_id=run_id)
+    return run_id
+
+
+@pytest.mark.parametrize("transition", ["schedule", "block", "request-review"])
+def test_worker_handoff_clears_task_birth_but_keeps_run_identity(store, transition):
+    task_id = kb.create_task(store, title="Worker handoff", assignee="implementer")
+    assert kb.claim_task(store, task_id)
+    run_id = _stamp_worker(store, task_id)
+    actions = {
+        "schedule": lambda: kb.schedule_task(store, task_id, expected_run_id=run_id),
+        "block": lambda: kb.block_task(store, task_id, kind="transient", expected_run_id=run_id),
+        "request-review": lambda: kb.request_review(store, task_id, reviewer="first-reviewer", expected_run_id=run_id),
+    }
+    assert actions[transition]()
+    assert store.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] is None
+    assert store.execute("SELECT worker_started_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0] == "fixture-bound"
+
+
+@pytest.mark.parametrize("case", ["retired", "no-result", "wrong-birth", "wrong-result-pid", "live-proxy", "live-bound"])
+def test_legacy_birth_requires_ended_run_terminal_receipt_and_dead_workers(store, monkeypatch, case):
+    from hermes_cli import kanban_db_dispatch as dispatch
+    from hermes_cli.kanban_review_routing import route_review
+
+    task_id = _pending_review(store)
+    assert kb.claim_review_task(store, task_id)
+    run_id = _stamp_worker(store, task_id)
+    assert kb.schedule_task(store, task_id, reason="Partial native review", expected_run_id=run_id)
+    with kb.write_txn(store):
+        birth = "foreign-birth" if case == "wrong-birth" else "fixture-spawn"
+        store.execute("UPDATE tasks SET worker_started_at = ? WHERE id = ?", (birth, task_id))
+        store.execute("UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL WHERE id = ?", (run_id,))
+        if case != "no-result":
+            kb._append_event(store, task_id, "worker_result", {"pid": 789 if case == "wrong-result-pid" else 456, "exit_code": 0}, run_id=run_id)
+    live = {"live-proxy": 123, "live-bound": 456}.get(case)
+    monkeypatch.setattr(dispatch, "_worker_alive", lambda pid, _birth: pid == live)
+    before = list(store.iterdump())
+    ok, _reason = route_review(store, task_id, target="review", reviewer="second-reviewer", expected_event_id=_event_id(store, task_id))
+    assert ok is (case == "retired")
+    if ok:
+        assert store.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] is None
+        payload = kb.list_events(store, task_id)[-1].payload
+        assert payload is not None
+        assert payload["retired_worker_started_at"] == "fixture-spawn"
+        assert payload["retired_worker_run_id"] == run_id
+    else:
+        assert list(store.iterdump()) == before
+
+
 def _pending_review(conn):
     task_id = kb.create_task(conn, title="Pending review", assignee="implementer")
     assert kb.request_review(conn, task_id, reviewer="first-reviewer", summary="Checkpoint")

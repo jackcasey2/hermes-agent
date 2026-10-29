@@ -1049,6 +1049,10 @@ worker-scheduled review also qualifies when its durable
 claim event proves that the ended run was claimed from Review; reason text alone
 is never sufficient. Its original implementation checkpoint is retained beneath
 the partial review checkpoint. Unrelated implementation schedules are refused.
+Old handoffs sometimes retained a process-start marker after clearing the PID.
+Routing retires that marker only when this exact closed phase has matching native
+spawn/bind events, a terminal worker receipt, and no matching live process;
+the routing event records the retired marker and run ID. Unproven markers refuse.
 Routing to Review requires satisfied parents and an explicit reviewer distinct from the
 original implementer. Parking clears the assignee; it is indefinite, not a timed
 wake-up. Resume with `route-review --target review`, **not** generic `unblock`,

@@ -100,6 +100,59 @@ def _routing_source(conn, task_id, status, origin, payload, implementer):
     return phase["run_id"], parking.get("prior_reviewer")
 
 
+def _ownership_problem(conn, task):
+    if any(task[key] is not None for key in (
+        "claim_lock", "claim_expires", "worker_pid", "current_run_id",
+    )):
+        return "task has inconsistent ownership"
+    if conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1", (task["id"],),
+    ).fetchone():
+        return "task has an open run"
+    return None
+
+
+def _retired_worker_birth(conn, task, run_id):
+    """Prove legacy debris using the closed phase's exit receipt and process identities."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as dispatch
+
+    birth = task["worker_started_at"]
+    if birth is None:
+        return True
+    if not birth or birth == dispatch.UNVERIFIED_WORKER_FINGERPRINT:
+        return False
+    if not conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? AND id = ? AND ended_at IS NOT NULL",
+        (task["id"], run_id),
+    ).fetchone():
+        return False
+    receipt = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'worker_result' ORDER BY id DESC LIMIT 1", (task["id"], run_id),
+    ).fetchone()
+    result = kb._json_dict(receipt["payload"]) if receipt else {}
+    if type(result.get("exit_code")) is not int:
+        return False
+    events = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind IN ('spawned', 'worker_bound') AND id < ? ORDER BY id",
+        (task["id"], run_id, receipt["id"]),
+    ).fetchall()
+    workers = [kb._json_dict(event["payload"]) for event in events]
+    if not any(worker.get("started_at") == birth for worker in workers):
+        return False
+    if not any(worker.get("pid") == result.get("pid") for worker in workers):
+        return False
+    for worker in workers:
+        pid, started_at = worker.get("pid"), worker.get("started_at")
+        if type(pid) is not int or pid < 1 or not started_at or started_at == dispatch.UNVERIFIED_WORKER_FINGERPRINT:
+            return False
+        if dispatch._worker_alive(pid, started_at):
+            return False
+    return True
+
+
 def route_review(
     conn: sqlite3.Connection, task_id: str, *, target: str, expected_event_id: int,
     reviewer: str | None = None, summary: str | None = None, metadata: dict | None = None,
@@ -127,14 +180,9 @@ def route_review(
             return False, "task not found"
         if task["status"] not in {"review", "scheduled"}:
             return False, "task is not a pending or parked review"
-        if any(task[key] is not None for key in (
-            "claim_lock", "claim_expires", "worker_pid", "worker_started_at", "current_run_id",
-        )):
-            return False, "task has inconsistent ownership"
-        if conn.execute(
-            "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1", (task_id,),
-        ).fetchone():
-            return False, "task has an open run"
+        ownership_problem = _ownership_problem(conn, task)
+        if ownership_problem:
+            return False, ownership_problem
         latest_id = conn.execute(
             "SELECT MAX(id) FROM task_events WHERE task_id = ?", (task_id,),
         ).fetchone()[0]
@@ -147,6 +195,8 @@ def route_review(
         if source is None:
             return False, "task has no current pending/parked-review provenance"
         checkpoint_run, prior_reviewer = source
+        if not _retired_worker_birth(conn, task, checkpoint_run):
+            return False, "task has unproven worker birth metadata"
         if target == "review":
             if not reviewer or reviewer == implementer:
                 return False, "an explicit reviewer distinct from the implementer is required"
@@ -170,6 +220,9 @@ def route_review(
             "prior_reviewer": prior_reviewer, "origin_review_event_id": origin["id"],
             "resume_status": "review",
         }
+        if task["worker_started_at"] is not None:
+            event_payload["retired_worker_started_at"] = task["worker_started_at"]
+            event_payload["retired_worker_run_id"] = checkpoint_run
         kb._append_event(
             conn, task_id, "review_requested" if target == "review" else "scheduled",
             event_payload, run_id=run_id,
