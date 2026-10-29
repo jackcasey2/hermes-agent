@@ -3191,7 +3191,7 @@ def block_task(
                    SET status        = '{new_status}',
                        claim_lock    = NULL,
                        claim_expires = NULL,
-                       worker_pid    = NULL,
+                       worker_pid    = NULL, worker_started_at = NULL,
                        {set_sql}
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -3352,7 +3352,7 @@ def request_review(
                    SET status        = 'review',
                        claim_lock    = NULL,
                        claim_expires = NULL,
-                       worker_pid    = NULL
+                       worker_pid    = NULL, worker_started_at = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -3876,7 +3876,7 @@ def schedule_task(
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL, worker_started_at = NULL
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
