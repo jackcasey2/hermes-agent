@@ -625,6 +625,27 @@ def test_launch_external_worker_degrades_by_default_with_real_helper(
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
 
 
+@pytest.mark.parametrize("wheel_layout", [False, True])
+def test_worker_import_ignores_a_shadowing_workspace(tmp_path, monkeypatch, wheel_layout):
+    """A worker's cwd must not replace its dispatcher-pinned install before bootstrap."""
+    from cron import scheduler_worker_env
+
+    pinned = tmp_path / "dispatcher-install"
+    workspace = tmp_path / "worker-checkout"
+    pinned.mkdir()
+    workspace.mkdir()
+    (pinned / "worker_origin_probe.py").write_text("print('dispatcher-install')\n")
+    (workspace / "worker_origin_probe.py").write_text("print('wrong-checkout')\n")
+    monkeypatch.setattr(scheduler_worker_env, "_installed_purelib", lambda: pinned if wheel_layout else None)
+    monkeypatch.setattr(scheduler_worker_env, "_committed_dependency_site_packages", lambda _root: None)
+    env = dict(os.environ, PYTHONPATH=str(pinned))
+    env.pop("PYTHONSAFEPATH", None)
+    env = scheduler_worker_env.pin_hermes_tree_on_pythonpath(env, pinned)
+    result = subprocess.run([sys.executable, "-m", "worker_origin_probe"], cwd=workspace,
+                            env=env, text=True, capture_output=True, timeout=20, check=True)
+    assert result.stdout.strip() == "dispatcher-install"
+
+
 def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
     tmp_path, monkeypatch,
 ):
@@ -683,10 +704,12 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
     entries = spawned[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
     assert entries == [str(repo_root), str(tmp_path / "kept-by-sanitizer")]
 
-    # Wheel / pipx layout: repo_root == purelib -> untouched.
+    # Wheel / pipx layout: preserve PYTHONPATH, but still exclude the workspace.
     monkeypatch.setattr(worker_env_mod, "_installed_purelib", lambda: repo_root)
     untouched = {"PYTHONPATH": str(tmp_path / "kept-by-sanitizer")}
-    assert worker_env_mod.pin_hermes_tree_on_pythonpath(dict(untouched), repo_root) == untouched
+    assert worker_env_mod.pin_hermes_tree_on_pythonpath(dict(untouched), repo_root) == {
+        **untouched, "PYTHONSAFEPATH": "1",
+    }
     assert "PYTHONPATH" not in worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root)
 
 
@@ -739,7 +762,7 @@ def test_pin_restores_the_committed_generation_site_packages(tmp_path):
     # A runner that owns its dependencies has no committed generation: tree only.
     pm.environments.runtime_facts_path(repo_root).unlink()
     assert worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root) == {
-        "PYTHONPATH": str(repo_root)
+        "PYTHONPATH": str(repo_root), "PYTHONSAFEPATH": "1",
     }
 
 
