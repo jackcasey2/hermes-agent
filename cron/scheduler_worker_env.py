@@ -66,7 +66,7 @@ def pin_hermes_tree_on_pythonpath(worker_env: dict, repo_root: Path) -> dict:
     generation's ``site-packages`` -- to the worker env's own PYTHONPATH (never
     ``os.environ``'s).
 
-    Skipped when ``repo_root`` is the interpreter's ``purelib``: under a wheel / pipx /
+    PYTHONPATH injection is skipped when ``repo_root`` is the interpreter's ``purelib``: under a wheel / pipx /
     uv-tool install ``cron/`` lives in site-packages itself, which is already importable,
     and pinning it would move site-packages ahead of the stdlib on ``sys.path``.
 
@@ -75,6 +75,8 @@ def pin_hermes_tree_on_pythonpath(worker_env: dict, repo_root: Path) -> dict:
     and leases the committed generation before any third-party import, and exits the worker
     if it cannot.
     """
+    # ``python -m`` otherwise prepends the workspace ahead of our pinned install.
+    worker_env["PYTHONSAFEPATH"] = "1"
     root = str(repo_root)
     if _installed_purelib() == Path(root).resolve():
         return worker_env

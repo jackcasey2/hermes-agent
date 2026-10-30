@@ -974,6 +974,7 @@ hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
+hermes kanban route-review <id> --target review|scheduled --expected-event-id N [--reviewer PROFILE] [--summary "..."] [--metadata JSON]
 hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
 hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
 
@@ -1022,6 +1023,55 @@ kanban:
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
+
+### Rerouting and parking pending reviews
+
+Use `route-review` when implementation is already handed off and only review
+routing needs to change. Unlike `reopen-review` (implementation rework), this
+operation never passes through Ready. It atomically writes the final task state,
+a terminal checkpoint run, and linked provenance events in one transaction.
+
+Read `hermes kanban show <id> --json` first. Its top-level `latest_event_id`
+belongs to the same read snapshot as the task; pass that integer as
+`--expected-event-id`. Any intervening task event, including a comment, makes
+the operation refuse without writes. Re-read and reconsider rather than blindly
+retrying an outdated decision.
+
+```bash
+# N is latest_event_id from show --json; re-read it before each operation.
+hermes kanban route-review <id> --target scheduled --expected-event-id N
+hermes kanban route-review <id> --target review --reviewer independent-reviewer --expected-event-id N
+```
+
+Only pending Review and Scheduled cards with durable review provenance are
+accepted. Running cards and inconsistent ownership are refused. An existing
+worker-scheduled review also qualifies when its durable
+claim event proves that the ended run was claimed from Review; reason text alone
+is never sufficient. Its original implementation checkpoint is retained beneath
+the partial review checkpoint. Unrelated implementation schedules are refused.
+Old handoffs sometimes retained a process-start marker after clearing the PID.
+Routing retires that marker only when this exact closed phase has matching native
+spawn/bind events, a terminal worker receipt, and no matching live process;
+the routing event records the retired marker and run ID. Unproven markers refuse.
+Routing to Review requires satisfied parents and an explicit reviewer distinct from the
+original implementer. Parking clears the assignee; it is indefinite, not a timed
+wake-up. Resume with `route-review --target review`, **not** generic `unblock`,
+which refuses reviews explicitly parked by `route-review`. Unmarked legacy
+schedules retain their old unblock behavior; use `route-review` for a legacy
+review proven by its native claim. Implementation schedules are unchanged.
+
+Omitted `--summary` inherits the full prior checkpoint summary. `--metadata` is
+a JSON object shallow-merged over prior checkpoint fields; omitted fields survive,
+including commit identifiers and structured verification context. The new terminal
+run stores the full summary and metadata. Failure and block-loop counters are
+preserved. Subsequent reviewer claims and `request-changes` still return work to
+the implementer recorded in the authoritative `review_requested` event.
+
+Native callers can use
+`hermes_cli.kanban_review_routing.route_review(conn, task_id, *, target, expected_event_id, reviewer=None, summary=None, metadata=None)`;
+it returns `(ok, reason)` and owns its transaction (do not nest it). Reviewer
+qualification and provider-selection policies belong to the caller; the native
+operation enforces distinct canonical profile names, not deployment-specific policy.
 
 ### Scheduled task starts (`scheduled_at`)
 
